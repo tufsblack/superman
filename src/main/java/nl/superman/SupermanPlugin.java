@@ -7,6 +7,8 @@ import org.bukkit.Bukkit;
 import org.bukkit.GameMode;
 import org.bukkit.Input;
 import org.bukkit.Location;
+import org.bukkit.Material;
+import org.bukkit.NamespacedKey;
 import org.bukkit.Particle;
 import org.bukkit.Sound;
 import org.bukkit.World;
@@ -24,12 +26,19 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.block.Action;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
+import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.player.PlayerInteractEntityEvent;
+import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerSwapHandItemsEvent;
 import org.bukkit.event.player.PlayerToggleFlightEvent;
 import org.bukkit.inventory.EquipmentSlot;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.PlayerInventory;
+import org.bukkit.inventory.meta.ItemMeta;
+import org.bukkit.inventory.meta.components.EquippableComponent;
+import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitRunnable;
 import org.bukkit.util.Vector;
@@ -68,7 +77,9 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
 
     private static class State {
         boolean flying;
-        boolean posed;            // liggende vliegpose actief
+        boolean gliding;          // vlieganimatie (glijden) actief
+        boolean gliderEquipped;   // onzichtbare vleugels staan aan
+        ItemStack savedChest;     // jouw eigen borstplaat tijdens het vliegen
         boolean allowFlightBefore;
         Vector vel = new Vector();
         Location lastLoc;
@@ -89,9 +100,13 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
     private final Map<UUID, State> active = new HashMap<>();
     private final Set<UUID> heldVictims = new HashSet<>();
     private final List<Thrown> thrown = new ArrayList<>();
+    private NamespacedKey gliderKey;
+    private NamespacedKey savedChestKey;
 
     @Override
     public void onEnable() {
+        gliderKey = new NamespacedKey(this, "superman_glider");
+        savedChestKey = new NamespacedKey(this, "saved_chest");
         getServer().getPluginManager().registerEvents(this, this);
         new BukkitRunnable() {
             int tick = 0;
@@ -169,10 +184,6 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
         if (s == null) return;
         if (s.grab != null) releaseGrab(p, s);
         if (s.flying) stopFlying(p, s);
-        if (s.posed) {
-            setFlatPose(p, false);
-            s.posed = false;
-        }
         GameMode gm = p.getGameMode();
         if (gm != GameMode.CREATIVE && gm != GameMode.SPECTATOR) {
             p.setAllowFlight(s.allowFlightBefore);
@@ -223,10 +234,19 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
         s.vel = new Vector(0, 0.4, 0);
         s.lastLoc = p.getLocation();
         s.boomActive = false;
+        equipGlider(p, s);
         p.setGravity(false);
         p.setFallDistance(0);
         p.setVelocity(s.vel.clone());
         p.getWorld().playSound(p.getLocation(), Sound.ENTITY_FIREWORK_ROCKET_LAUNCH, 1f, 1f);
+
+        // Sonic boom bij het opstijgen: schokgolf over de grond + stof van het blok onder je
+        Location feet = p.getLocation();
+        sonicBoom(feet.clone().add(0, 0.3, 0), new Vector(0, -1, 0), 1.3, p);
+        Block below = feet.clone().subtract(0, 0.5, 0).getBlock();
+        if (!below.getType().isAir()) {
+            p.getWorld().spawnParticle(Particle.BLOCK, feet, 50, 0.6, 0.1, 0.6, 0.1, below.getBlockData());
+        }
     }
 
     private void stopFlying(Player p, State s) {
@@ -235,10 +255,7 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
         s.boomActive = false;
         p.setGravity(true);
         p.setFallDistance(0);
-        if (s.posed) {
-            setFlatPose(p, false);
-            s.posed = false;
-        }
+        unequipGlider(p, s);
     }
 
     // ====== Vliegen (elke tick) ======
@@ -278,19 +295,21 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
         p.setVelocity(s.vel.clone());
         p.setFallDistance(0);
 
-        // Liggende vliegpose (te zien voor andere spelers) zodra je vooruit vliegt
+        // Echte vlieganimatie (ook zichtbaar voor jezelf in F5) zodra je vooruit vliegt
         double speed = s.vel.length();
-        boolean wantPose = forward || speed > 0.9;
-        if (wantPose != s.posed) {
-            setFlatPose(p, wantPose);
-            s.posed = wantPose;
+        s.gliding = p.isGliding();
+        boolean wantGlide = forward || speed > 0.9;
+        if (wantGlide && !s.gliding && !p.isOnGround()) {
+            p.setGliding(true);
+        } else if (!wantGlide && s.gliding) {
+            p.setGliding(false);
         }
 
         // Sonic boom
         long now = System.currentTimeMillis();
         if (speed >= BOOM_SPEED) {
             if (!s.boomActive && now - s.lastBoom > BOOM_COOLDOWN_MS) {
-                sonicBoom(p.getLocation(), s.vel, p);
+                sonicBoom(p.getLocation().add(0, 1, 0), s.vel, 1.5, p);
                 s.lastBoom = now;
             }
             s.boomActive = true;
@@ -309,7 +328,7 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
     }
 
     // ====== Sonic boom ======
-    private void sonicBoom(Location loc, Vector direction, Entity... skip) {
+    private void sonicBoom(Location loc, Vector direction, double scale, Entity... skip) {
         World w = loc.getWorld();
         Vector d = direction.clone();
         if (d.lengthSquared() < 1.0E-6) d = new Vector(0, 1, 0);
@@ -327,15 +346,33 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
             u.normalize();
         }
         Vector v = d.clone().crossProduct(u).normalize();
-        for (int ring = 1; ring <= 3; ring++) {
-            double radius = ring * 1.5;
-            Location center = loc.clone().subtract(d.clone().multiply(ring * 0.8));
-            for (int i = 0; i < 32; i++) {
-                double a = i * Math.PI * 2 / 32;
-                Vector off = u.clone().multiply(Math.cos(a) * radius).add(v.clone().multiply(Math.sin(a) * radius));
-                w.spawnParticle(Particle.CLOUD, center.clone().add(off), 1, 0, 0, 0, 0);
+        // Uitdijende schokgolf: ringen die in 10 ticks groter worden en naar achteren driften
+        final Vector fd = d;
+        final Vector fu = u;
+        final Vector fv = v;
+        final Location origin = loc.clone();
+        w.spawnParticle(Particle.EXPLOSION, loc, 1);
+        new BukkitRunnable() {
+            int i = 0;
+
+            @Override
+            public void run() {
+                i++;
+                double radius = (1.0 + i * 1.4) * scale;
+                Location center = origin.clone().subtract(fd.clone().multiply(i * 0.5));
+                int points = (int) (24 + radius * 6);
+                for (int k = 0; k < points; k++) {
+                    double a = k * Math.PI * 2 / points;
+                    Vector off = fu.clone().multiply(Math.cos(a) * radius)
+                            .add(fv.clone().multiply(Math.sin(a) * radius));
+                    w.spawnParticle(Particle.CLOUD, center.clone().add(off), 1, 0, 0, 0, 0);
+                }
+                if (i % 3 == 1) {
+                    w.spawnParticle(Particle.SONIC_BOOM, center, 1);
+                }
+                if (i >= 10) cancel();
             }
-        }
+        }.runTaskTimer(this, 0L, 1L);
 
         // Schokgolf duwt dichtbije wezens weg
         for (LivingEntity le : w.getNearbyLivingEntities(loc, 8)) {
@@ -495,8 +532,9 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
         thrown.add(t);
 
         p.getWorld().playSound(p.getLocation(), Sound.ENTITY_PLAYER_ATTACK_STRONG, 2f, 0.7f);
-        if (speed >= THROW_BOOM_SPEED) {
-            sonicBoom(v.getLocation(), dir, p, v);
+        boolean flyingFast = s.flying && s.vel.length() >= BOOM_SPEED;
+        if (speed >= THROW_BOOM_SPEED || flyingFast) {
+            sonicBoom(v.getLocation().add(0, 0.5, 0), dir, 2.0, p, v);
         }
     }
 
@@ -568,6 +606,107 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
         State s = active.get(p.getUniqueId());
         if (s == null) return;
         if (s.grab != null) releaseGrab(p, s);
+        if (s.gliderEquipped) {
+            // Vleugels nooit laten vallen; jouw eigen borstplaat wel terugbezorgen
+            event.getDrops().removeIf(this::isGlider);
+            event.getItemsToKeep().removeIf(this::isGlider);
+            ItemStack saved = s.savedChest;
+            s.savedChest = null;
+            s.gliderEquipped = false;
+            p.getPersistentDataContainer().remove(savedChestKey);
+            if (event.getKeepInventory()) {
+                p.getInventory().setChestplate(saved);
+            } else if (saved != null) {
+                event.getDrops().add(saved);
+            }
+        }
         if (s.flying) stopFlying(p, s);
+    }
+
+    // ====== Onzichtbare vleugels: zorgen voor de echte vlieganimatie, ook in F5 ======
+    private ItemStack createGlider() {
+        ItemStack item = new ItemStack(Material.PAPER);
+        ItemMeta meta = item.getItemMeta();
+        meta.displayName(Component.text("Superman-vleugels", NamedTextColor.AQUA)
+                .decoration(TextDecoration.ITALIC, false));
+        meta.setGlider(true);
+        EquippableComponent eq = meta.getEquippable();
+        eq.setSlot(EquipmentSlot.CHEST);
+        meta.setEquippable(eq);
+        meta.getPersistentDataContainer().set(gliderKey, PersistentDataType.BYTE, (byte) 1);
+        item.setItemMeta(meta);
+        return item;
+    }
+
+    private boolean isGlider(ItemStack item) {
+        return item != null && item.hasItemMeta()
+                && item.getItemMeta().getPersistentDataContainer().has(gliderKey, PersistentDataType.BYTE);
+    }
+
+    private void equipGlider(Player p, State s) {
+        PlayerInventory inv = p.getInventory();
+        ItemStack current = inv.getChestplate();
+        if (isGlider(current)) {
+            s.gliderEquipped = true;
+            return;
+        }
+        if (current != null && !current.getType().isAir()) {
+            s.savedChest = current.clone();
+            // Ook veilig opgeslagen op de speler, voor het geval de server crasht tijdens het vliegen
+            p.getPersistentDataContainer().set(savedChestKey, PersistentDataType.BYTE_ARRAY,
+                    current.serializeAsBytes());
+        }
+        inv.setChestplate(createGlider());
+        s.gliderEquipped = true;
+    }
+
+    private void unequipGlider(Player p, State s) {
+        if (!s.gliderEquipped) return;
+        s.gliderEquipped = false;
+        p.setGliding(false);
+        s.gliding = false;
+        PlayerInventory inv = p.getInventory();
+        if (isGlider(inv.getChestplate())) {
+            inv.setChestplate(s.savedChest);
+        } else if (s.savedChest != null) {
+            returnItem(p, s.savedChest);
+        }
+        s.savedChest = null;
+        p.getPersistentDataContainer().remove(savedChestKey);
+    }
+
+    private void returnItem(Player p, ItemStack item) {
+        Map<Integer, ItemStack> left = p.getInventory().addItem(item);
+        for (ItemStack rest : left.values()) {
+            p.getWorld().dropItemNaturally(p.getLocation(), rest);
+        }
+    }
+
+    @EventHandler
+    public void onJoin(PlayerJoinEvent event) {
+        Player p = event.getPlayer();
+        if (active.containsKey(p.getUniqueId())) return;
+        p.setGravity(true);
+        PlayerInventory inv = p.getInventory();
+        byte[] data = p.getPersistentDataContainer().get(savedChestKey, PersistentDataType.BYTE_ARRAY);
+        if (data == null) {
+            if (isGlider(inv.getChestplate())) inv.setChestplate(null);
+            return;
+        }
+        ItemStack saved = ItemStack.deserializeBytes(data);
+        ItemStack chest = inv.getChestplate();
+        if (isGlider(chest) || chest == null || chest.getType().isAir()) {
+            inv.setChestplate(saved);
+        } else {
+            returnItem(p, saved);
+        }
+        p.getPersistentDataContainer().remove(savedChestKey);
+    }
+
+    @EventHandler
+    public void onInventoryClick(InventoryClickEvent event) {
+        if (isGlider(event.getCurrentItem()) || isGlider(event.getCursor())) {
+            event.setCancelled(true);
+        }
     }
 }
