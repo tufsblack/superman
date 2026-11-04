@@ -3,7 +3,9 @@ package nl.superman;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 import net.kyori.adventure.text.format.TextDecoration;
+import net.kyori.adventure.title.Title;
 import org.bukkit.Bukkit;
+import org.bukkit.FluidCollisionMode;
 import org.bukkit.GameMode;
 import org.bukkit.Input;
 import org.bukkit.Location;
@@ -13,6 +15,7 @@ import org.bukkit.Particle;
 import org.bukkit.Sound;
 import org.bukkit.World;
 import org.bukkit.block.Block;
+import org.bukkit.block.data.BlockData;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.ArmorStand;
@@ -41,8 +44,10 @@ import org.bukkit.inventory.meta.components.EquippableComponent;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitRunnable;
+import org.bukkit.util.RayTraceResult;
 import org.bukkit.util.Vector;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -60,7 +65,15 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
     private static final double HOVER_MOVE_SPEED = 0.6;   // zijwaarts/achteruit
     private static final double VERTICAL_SPEED = 0.6;     // spatie = omhoog, shift = omlaag
     private static final double ACCELERATION = 0.10;      // hoe snel je optrekt
-    private static final double BRAKE = 0.25;             // hoe snel je stilstaat als je geen toets indrukt
+    private static final double BRAKE_HORIZONTAL = 0.30; // remmen zonder toetsen (zijwaarts/vooruit)
+    private static final double BRAKE_VERTICAL = 0.35;   // remmen in de hoogte
+    private static final double VERTICAL_RESPONSE = 0.30; // hoe snel je omhoog/omlaag reageert
+
+    // Vasthouden: afstand voor je en hoogte vanaf je voeten (pas aan als het niet precies klopt)
+    private static final double HOLD_FRONT = 0.55;
+    private static final double HOLD_HEIGHT = 0.9;
+    private static final double HOLD_FRONT_GLIDING = 1.6;
+    private static final double HOLD_HEIGHT_GLIDING = 0.15;
     private static final double BOOM_SPEED = 2.0;         // vanaf deze snelheid krijg je een sonic boom
     private static final long BOOM_COOLDOWN_MS = 2500;
 
@@ -204,6 +217,10 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
         if (s.flying) {
             bar = bar.append(Component.text(" | " + Math.round(s.vel.length() * 20) + " blokken/sec",
                     NamedTextColor.AQUA));
+            if (s.vel.length() >= BOOM_SPEED) {
+                bar = bar.append(Component.text(String.format(" | Mach %.1f", machOf(s.vel.length())),
+                        NamedTextColor.GOLD, TextDecoration.BOLD));
+            }
         }
         if (s.grab != null) {
             bar = bar.append(Component.text(" | Vast: " + s.grab.entity.getName(), NamedTextColor.YELLOW));
@@ -240,13 +257,7 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
         p.setVelocity(s.vel.clone());
         p.getWorld().playSound(p.getLocation(), Sound.ENTITY_FIREWORK_ROCKET_LAUNCH, 1f, 1f);
 
-        // Sonic boom bij het opstijgen: schokgolf over de grond + stof van het blok onder je
-        Location feet = p.getLocation();
-        sonicBoom(feet.clone().add(0, 0.3, 0), new Vector(0, -1, 0), 1.3, p);
-        Block below = feet.clone().subtract(0, 0.5, 0).getBlock();
-        if (!below.getType().isAir()) {
-            p.getWorld().spawnParticle(Particle.BLOCK, feet, 50, 0.6, 0.1, 0.6, 0.1, below.getBlockData());
-        }
+        takeoffBoom(p);
     }
 
     private void stopFlying(Player p, State s) {
@@ -267,38 +278,60 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
         if (flat.lengthSquared() > 1.0E-6) flat.normalize();
         Vector right = new Vector(-flat.getZ(), 0, flat.getX());
 
-        // Tegen iets aangevlogen? Dan remmen we sterk af.
-        if (s.lastLoc != null && s.lastLoc.getWorld() == loc.getWorld()) {
-            double moved = loc.toVector().distance(s.lastLoc.toVector());
-            double expected = s.vel.length();
-            if (expected > 0.6 && moved < expected * 0.35) {
-                s.vel.multiply(0.35);
-            }
-        }
-        s.lastLoc = loc;
-
         boolean forward = in.isForward();
+        boolean back = in.isBackward();
+        boolean left = in.isLeft();
+        boolean rightKey = in.isRight();
+        boolean jump = in.isJump();
+        boolean sneak = in.isSneak();
         double maxSpeed = in.isSprint() ? MAX_SPRINT_SPEED : MAX_SPEED;
 
+        // Gewenste snelheid
         Vector desired = new Vector();
         if (forward) desired.add(look.clone().multiply(maxSpeed));
-        if (in.isBackward()) desired.add(flat.clone().multiply(-HOVER_MOVE_SPEED));
-        if (in.isLeft()) desired.subtract(right.clone().multiply(HOVER_MOVE_SPEED));
-        if (in.isRight()) desired.add(right.clone().multiply(HOVER_MOVE_SPEED));
-        if (in.isJump()) desired.add(new Vector(0, VERTICAL_SPEED, 0));
-        if (in.isSneak()) desired.add(new Vector(0, -VERTICAL_SPEED, 0));
-        if (desired.length() > maxSpeed) desired.normalize().multiply(maxSpeed);
+        if (back) desired.add(flat.clone().multiply(-HOVER_MOVE_SPEED));
+        if (left) desired.subtract(right.clone().multiply(HOVER_MOVE_SPEED));
+        if (rightKey) desired.add(right.clone().multiply(HOVER_MOVE_SPEED));
+        Vector desH = new Vector(desired.getX(), 0, desired.getZ());
+        if (desH.length() > maxSpeed) desH.normalize().multiply(maxSpeed);
+        double desY = desired.getY();
+        if (jump) desY += VERTICAL_SPEED;
+        if (sneak) desY -= VERTICAL_SPEED;
+        desY = Math.max(-maxSpeed, Math.min(maxSpeed, desY));
 
-        double rate = desired.lengthSquared() > 0 ? ACCELERATION : BRAKE;
-        s.vel.add(desired.subtract(s.vel).multiply(rate));
+        // Horizontaal en verticaal apart: zo blijft omhoog vliegen recht omhoog,
+        // en remt je voorwaartse snelheid meteen af als je stopt met W.
+        boolean hInput = forward || back || left || rightKey;
+        boolean vInput = forward || jump || sneak;
+        double rateH = hInput ? ACCELERATION : BRAKE_HORIZONTAL;
+        double rateY = (jump || sneak) ? VERTICAL_RESPONSE : (vInput ? ACCELERATION : BRAKE_VERTICAL);
+
+        Vector velH = new Vector(s.vel.getX(), 0, s.vel.getZ());
+        velH.add(desH.subtract(velH).multiply(rateH));
+        double velY = s.vel.getY() + (desY - s.vel.getY()) * rateY;
+        s.vel = new Vector(velH.getX(), velY, velH.getZ());
+
+        // Een blok vlak voor je? Dan rem je netjes af in plaats van er tegenaan te knallen
+        double sp = s.vel.length();
+        if (sp > 0.05) {
+            Location mid = loc.clone().add(0, 0.9, 0);
+            RayTraceResult hit = loc.getWorld().rayTraceBlocks(mid, s.vel.clone().normalize(), sp + 1.0,
+                    FluidCollisionMode.NEVER, true);
+            if (hit != null) {
+                double allowed = Math.max(0, hit.getHitPosition().distance(mid.toVector()) - 0.8);
+                if (allowed < sp) s.vel.multiply(allowed / sp);
+            }
+        }
 
         p.setVelocity(s.vel.clone());
         p.setFallDistance(0);
 
-        // Echte vlieganimatie (ook zichtbaar voor jezelf in F5) zodra je vooruit vliegt
+        // Vlieganimatie: alleen liggend als je vooruit vliegt. Recht omhoog/omlaag of zweven = rechtop.
         double speed = s.vel.length();
+        double hSpeed = Math.hypot(s.vel.getX(), s.vel.getZ());
         s.gliding = p.isGliding();
-        boolean wantGlide = forward || speed > 0.9;
+        boolean verticalOnly = (jump || sneak) && !forward;
+        boolean wantGlide = forward || (!verticalOnly && hSpeed > 1.2);
         if (wantGlide && !s.gliding && !p.isOnGround()) {
             p.setGliding(true);
         } else if (!wantGlide && s.gliding) {
@@ -309,11 +342,13 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
         long now = System.currentTimeMillis();
         if (speed >= BOOM_SPEED) {
             if (!s.boomActive && now - s.lastBoom > BOOM_COOLDOWN_MS) {
-                sonicBoom(p.getLocation().add(0, 1, 0), s.vel, 1.5, p);
+                double mach = machOf(speed);
+                sonicBoom(p.getLocation().add(0, 1, 0), s.vel, mach, 1.5, p);
+                showBoomTitle(p, mach);
                 s.lastBoom = now;
             }
             s.boomActive = true;
-            p.getWorld().spawnParticle(Particle.CLOUD, p.getLocation().add(0, 1, 0), 8, 0.4, 0.4, 0.4, 0.05);
+            vaporRing(p.getLocation().add(0, 1, 0), s.vel);
         } else if (speed < BOOM_SPEED * 0.8) {
             s.boomActive = false;
         }
@@ -327,18 +362,15 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
         }
     }
 
-    // ====== Sonic boom ======
-    private void sonicBoom(Location loc, Vector direction, double scale, Entity... skip) {
-        World w = loc.getWorld();
-        Vector d = direction.clone();
-        if (d.lengthSquared() < 1.0E-6) d = new Vector(0, 1, 0);
-        d.normalize();
+    // ====== Echte sonic boom ======
+    // In het spel geldt BOOM_SPEED als "geluidssnelheid" (Mach 1). Daarboven verandert de schokkegel net als
+    // in het echt: halve tophoek = asin(1 / Mach). Bij Mach 1 is het een vlakke schijf, bij Mach 2 een
+    // spitse kegel van 30 graden. Bij een echte sonic boom hoor je ook een dubbele knal.
+    private double machOf(double speed) {
+        return Math.max(1.05, Math.min(4.0, speed / BOOM_SPEED));
+    }
 
-        w.playSound(loc, Sound.ENTITY_WARDEN_SONIC_BOOM, 4f, 1f);
-        w.playSound(loc, Sound.ENTITY_GENERIC_EXPLODE, 2f, 1.5f);
-        w.spawnParticle(Particle.SONIC_BOOM, loc, 1);
-
-        // Schokgolfringen loodrecht op de vliegrichting
+    private Vector[] basis(Vector d) {
         Vector u = d.clone().crossProduct(new Vector(0, 1, 0));
         if (u.lengthSquared() < 1.0E-4) {
             u = new Vector(1, 0, 0);
@@ -346,36 +378,83 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
             u.normalize();
         }
         Vector v = d.clone().crossProduct(u).normalize();
-        // Uitdijende schokgolf: ringen die in 10 ticks groter worden en naar achteren driften
-        final Vector fd = d;
-        final Vector fu = u;
-        final Vector fv = v;
+        return new Vector[]{u, v};
+    }
+
+    private void showBoomTitle(Player p, double mach) {
+        p.showTitle(Title.title(Component.empty(),
+                Component.text(String.format("SONIC BOOM - Mach %.1f", mach), NamedTextColor.GOLD,
+                        TextDecoration.BOLD),
+                Title.Times.times(Duration.ZERO, Duration.ofMillis(800), Duration.ofMillis(300))));
+    }
+
+    private void sonicBoom(Location loc, Vector direction, double mach, double scale, Entity... skip) {
+        World w = loc.getWorld();
+        Vector dir = direction.clone();
+        if (dir.lengthSquared() < 1.0E-6) dir = new Vector(0, 1, 0);
+        dir.normalize();
+        final Vector fd = dir;
+        Vector[] b = basis(fd);
+        final Vector fu = b[0];
+        final Vector fv = b[1];
         final Location origin = loc.clone();
-        w.spawnParticle(Particle.EXPLOSION, loc, 1);
+
+        // Dubbele knal
+        w.playSound(loc, Sound.ENTITY_LIGHTNING_BOLT_THUNDER, 8f, 1.5f);
+        w.playSound(loc, Sound.ENTITY_GENERIC_EXPLODE, 4f, 1.3f);
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            w.playSound(origin, Sound.ENTITY_LIGHTNING_BOLT_THUNDER, 8f, 1.2f);
+            w.playSound(origin, Sound.ENTITY_GENERIC_EXPLODE, 4f, 0.9f);
+        }, 4L);
+
+        // Lichtflits en kern
+        w.spawnParticle(Particle.EXPLOSION_EMITTER, loc, 1);
+        w.spawnParticle(Particle.END_ROD, loc, 60, 0.6, 0.6, 0.6, 0.35);
+
+        final double tanMach = Math.tan(Math.asin(1.0 / mach));
+        final double coneLength = 16 * scale;
+        final double maxRadius = 9 * scale;
+
         new BukkitRunnable() {
             int i = 0;
 
             @Override
             public void run() {
                 i++;
-                double radius = (1.0 + i * 1.4) * scale;
-                Location center = origin.clone().subtract(fd.clone().multiply(i * 0.5));
-                int points = (int) (24 + radius * 6);
-                for (int k = 0; k < points; k++) {
-                    double a = k * Math.PI * 2 / points;
-                    Vector off = fu.clone().multiply(Math.cos(a) * radius)
-                            .add(fv.clone().multiply(Math.sin(a) * radius));
-                    w.spawnParticle(Particle.CLOUD, center.clone().add(off), 1, 0, 0, 0, 0);
+
+                // 1) Schokgolfschijf loodrecht op de vliegrichting, dijt uit en drijft naar achteren
+                double ringR = (1.0 + i * 1.3) * scale;
+                Location rc = origin.clone().subtract(fd.clone().multiply(i * 0.4));
+                int pts = (int) (24 + ringR * 6);
+                for (int k = 0; k < pts; k++) {
+                    double a = k * Math.PI * 2 / pts;
+                    Vector off = fu.clone().multiply(Math.cos(a) * ringR).add(fv.clone().multiply(Math.sin(a) * ringR));
+                    w.spawnParticle(Particle.CLOUD, rc.clone().add(off), 1, 0, 0, 0, 0);
                 }
-                if (i % 3 == 1) {
-                    w.spawnParticle(Particle.SONIC_BOOM, center, 1);
+
+                // 2) Machkegel (condensatiewolk): schil die in 8 ticks achter je uitgroeit
+                if (i <= 8) {
+                    double from = (i - 1) * coneLength / 8;
+                    double to = i * coneLength / 8;
+                    for (double a = from; a < to; a += 0.7) {
+                        double r = Math.min(a * tanMach, maxRadius);
+                        Location axis = origin.clone().subtract(fd.clone().multiply(a));
+                        int n = Math.max(8, (int) (r * 5));
+                        for (int k = 0; k < n; k++) {
+                            double ang = k * Math.PI * 2 / n;
+                            Vector off = fu.clone().multiply(Math.cos(ang) * r)
+                                    .add(fv.clone().multiply(Math.sin(ang) * r));
+                            w.spawnParticle(Particle.CLOUD, axis.clone().add(off), 1, 0, 0, 0, 0);
+                        }
+                    }
                 }
-                if (i >= 10) cancel();
+                if (i >= 12) cancel();
             }
         }.runTaskTimer(this, 0L, 1L);
 
         // Schokgolf duwt dichtbije wezens weg
-        for (LivingEntity le : w.getNearbyLivingEntities(loc, 8)) {
+        double blastR = Math.min(12, 6 * scale);
+        for (LivingEntity le : w.getNearbyLivingEntities(loc, blastR)) {
             boolean skipIt = heldVictims.contains(le.getUniqueId());
             for (Entity ex : skip) {
                 if (ex == le) skipIt = true;
@@ -385,6 +464,49 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
             if (push.lengthSquared() < 1.0E-6) continue;
             le.setVelocity(push.normalize().multiply(1.0).setY(0.4));
         }
+    }
+
+    /** Condensatieringen achter je zolang je supersonisch vliegt. */
+    private void vaporRing(Location at, Vector vel) {
+        if (vel.lengthSquared() < 1.0E-6) return;
+        Vector d = vel.clone().normalize();
+        Vector[] b = basis(d);
+        Location c = at.clone().subtract(d.clone().multiply(2.5));
+        World w = at.getWorld();
+        for (int k = 0; k < 20; k++) {
+            double a = k * Math.PI * 2 / 20;
+            Vector off = b[0].clone().multiply(Math.cos(a) * 1.8).add(b[1].clone().multiply(Math.sin(a) * 1.8));
+            w.spawnParticle(Particle.CLOUD, c.clone().add(off), 1, 0, 0, 0, 0);
+        }
+    }
+
+    /** Sonic boom bij het opstijgen: kegel naar beneden, schokgolf over de grond en stof. */
+    private void takeoffBoom(Player p) {
+        final Location feet = p.getLocation();
+        final World w = feet.getWorld();
+        sonicBoom(feet.clone().add(0, 0.6, 0), new Vector(0, 1, 0), 1.5, 1.2, p);
+
+        Block below = feet.clone().subtract(0, 0.5, 0).getBlock();
+        final BlockData data = below.getType().isAir() ? null : below.getBlockData();
+        new BukkitRunnable() {
+            int i = 0;
+
+            @Override
+            public void run() {
+                i++;
+                double r = i * 1.4;
+                int pts = (int) (16 + r * 8);
+                for (int k = 0; k < pts; k++) {
+                    double a = k * Math.PI * 2 / pts;
+                    Location pt = feet.clone().add(Math.cos(a) * r, 0.2, Math.sin(a) * r);
+                    w.spawnParticle(Particle.CLOUD, pt, 1, 0, 0, 0, 0);
+                    if (data != null) {
+                        w.spawnParticle(Particle.BLOCK, pt, 2, 0.2, 0.1, 0.2, 0.05, data);
+                    }
+                }
+                if (i >= 9) cancel();
+            }
+        }.runTaskTimer(this, 0L, 1L);
     }
 
     // ====== Oppakken (rechtermuisknop op een wezen) ======
@@ -424,7 +546,7 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
         p.getWorld().playSound(victim.getLocation(), Sound.ENTITY_PLAYER_ATTACK_KNOCKBACK, 1f, 1.2f);
     }
 
-    /** Houdt het slachtoffer elke tick bij de heupen: liggend, dwars voor de speler. */
+    /** Houdt het slachtoffer elke tick midden voor je vast: liggend, op heuphoogte bij je handen. */
     private void holdTick(Player p, State s) {
         LivingEntity v = s.grab.entity;
         if (!v.isValid() || v.isDead() || v.getWorld() != p.getWorld()) {
@@ -432,16 +554,19 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
             return;
         }
         Location pl = p.getLocation();
+        Vector look = pl.getDirection();
         double yaw = Math.toRadians(pl.getYaw());
         Vector f = new Vector(-Math.sin(yaw), 0, Math.cos(yaw));
-        Vector right = new Vector(-f.getZ(), 0, f.getX());
 
-        Location target = pl.clone()
-                .add(f.clone().multiply(0.7))
-                .subtract(right.clone().multiply(0.9))
-                .add(0, 0.7, 0);
+        Location target;
+        if (s.gliding) {
+            // Jij ligt horizontaal: het slachtoffer ligt recht voor je uit in jouw kijkrichting
+            target = pl.clone().add(look.clone().multiply(HOLD_FRONT_GLIDING)).add(0, HOLD_HEIGHT_GLIDING, 0);
+        } else {
+            target = pl.clone().add(f.clone().multiply(HOLD_FRONT)).add(0, HOLD_HEIGHT, 0);
+        }
         if (s.flying) target.add(s.vel);
-        target.setYaw(pl.getYaw() + 90f);
+        target.setYaw(pl.getYaw());
         target.setPitch(0f);
 
         v.teleport(target);
@@ -534,7 +659,9 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
         p.getWorld().playSound(p.getLocation(), Sound.ENTITY_PLAYER_ATTACK_STRONG, 2f, 0.7f);
         boolean flyingFast = s.flying && s.vel.length() >= BOOM_SPEED;
         if (speed >= THROW_BOOM_SPEED || flyingFast) {
-            sonicBoom(v.getLocation().add(0, 0.5, 0), dir, 2.0, p, v);
+            double mach = machOf(speed);
+            sonicBoom(v.getLocation().add(0, 0.5, 0), dir, mach, 1.8, p, v);
+            showBoomTitle(p, mach);
         }
     }
 
