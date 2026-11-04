@@ -30,6 +30,7 @@ import org.bukkit.event.block.Action;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.event.player.PlayerDropItemEvent;
 import org.bukkit.event.player.PlayerInteractEntityEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
@@ -64,21 +65,21 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
     private static final double MAX_SPRINT_SPEED = 3.0;   // snel vliegen met sprint-toets (60 blokken/sec)
     private static final double HOVER_MOVE_SPEED = 0.6;   // zijwaarts/achteruit
     private static final double VERTICAL_SPEED = 0.6;     // spatie = omhoog, shift = omlaag
-    private static final double ACCELERATION = 0.10;      // hoe snel je optrekt
+    private static final double ACCELERATION = 0.14;      // hoe snel je optrekt
     private static final double BRAKE_HORIZONTAL = 0.30; // remmen zonder toetsen (zijwaarts/vooruit)
     private static final double BRAKE_VERTICAL = 0.35;   // remmen in de hoogte
-    private static final double VERTICAL_RESPONSE = 0.30; // hoe snel je omhoog/omlaag reageert
+    private static final double VERTICAL_RESPONSE = 0.40; // hoe snel je omhoog/omlaag reageert
 
     // Vasthouden: afstand voor je en hoogte vanaf je voeten (pas aan als het niet precies klopt)
-    private static final double HOLD_FRONT = 0.55;
-    private static final double HOLD_HEIGHT = 0.9;
-    private static final double HOLD_FRONT_GLIDING = 1.6;
-    private static final double HOLD_HEIGHT_GLIDING = 0.15;
+    private static final double HOLD_FRONT = 0.45;
+    private static final double HOLD_HEIGHT = 0.85;
+    private static final double HOLD_FRONT_GLIDING = 0.8;
+    private static final double HOLD_HEIGHT_GLIDING = 0.1;
     private static final double BOOM_SPEED = 2.0;         // vanaf deze snelheid krijg je een sonic boom
     private static final long BOOM_COOLDOWN_MS = 2500;
 
-    private static final double THROW_SPEED = 2.0;        // normale worp (linkermuisknop)
-    private static final double HARD_THROW_SPEED = 4.0;   // harde worp (sneaken + linkermuisknop)
+    private static final double SONIC_THROW_SPEED = 4.0;  // elke worp is een sonic worp (Minecraft kapt af op 3,9)
+    private static final double HIGH_THROW_HEIGHT = 20;   // zo hoog boven de grond is een worp dodelijk
     private static final double THROW_BOOM_SPEED = 3.0;   // vanaf deze worpsnelheid een sonic boom
     private static final double IMPACT_DAMAGE_PER_SPEED = 3.0; // schade bij inslag = snelheid * dit
 
@@ -108,6 +109,7 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
         int ticks;
         Location last;
         boolean wasAware = true;
+        boolean lethal;
     }
 
     private final Map<UUID, State> active = new HashMap<>();
@@ -187,7 +189,7 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
                 .append(Component.text("AAN", NamedTextColor.GREEN, TextDecoration.BOLD)));
         p.sendMessage(Component.text(
                 "Dubbel spatie = vliegen aan/uit | Rechtermuisknop op iemand = oppakken | "
-                        + "Rechtermuisknop of F = loslaten | Linkermuisknop = gooien (sneaken = harde worp)",
+                        + "Rechtermuisknop of F = loslaten | Linkermuisknop of Q = sonic worp",
                 NamedTextColor.GRAY));
         sendBar(p, s);
     }
@@ -214,14 +216,6 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
                 .append(s.flying
                         ? Component.text("GEACTIVEERD", NamedTextColor.GREEN, TextDecoration.BOLD)
                         : Component.text("GEDEACTIVEERD", NamedTextColor.RED, TextDecoration.BOLD));
-        if (s.flying) {
-            bar = bar.append(Component.text(" | " + Math.round(s.vel.length() * 20) + " blokken/sec",
-                    NamedTextColor.AQUA));
-            if (s.vel.length() >= BOOM_SPEED) {
-                bar = bar.append(Component.text(String.format(" | Mach %.1f", machOf(s.vel.length())),
-                        NamedTextColor.GOLD, TextDecoration.BOLD));
-            }
-        }
         if (s.grab != null) {
             bar = bar.append(Component.text(" | Vast: " + s.grab.entity.getName(), NamedTextColor.YELLOW));
         }
@@ -330,8 +324,11 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
         double speed = s.vel.length();
         double hSpeed = Math.hypot(s.vel.getX(), s.vel.getZ());
         s.gliding = p.isGliding();
+        // Bij een steile hoek (bijna recht omhoog/omlaag) blijf je rechtop, zoals Superman die omhoog schiet
+        double pitch = Math.abs(loc.getPitch());
+        boolean steep = s.gliding ? pitch > 62 : pitch > 50;
         boolean verticalOnly = (jump || sneak) && !forward;
-        boolean wantGlide = forward || (!verticalOnly && hSpeed > 1.2);
+        boolean wantGlide = !steep && (forward || (!verticalOnly && hSpeed > 1.2));
         if (wantGlide && !s.gliding && !p.isOnGround()) {
             p.setGliding(true);
         } else if (!wantGlide && s.gliding) {
@@ -344,7 +341,6 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
             if (!s.boomActive && now - s.lastBoom > BOOM_COOLDOWN_MS) {
                 double mach = machOf(speed);
                 sonicBoom(p.getLocation().add(0, 1, 0), s.vel, mach, 1.5, p);
-                showBoomTitle(p, mach);
                 s.lastBoom = now;
             }
             s.boomActive = true;
@@ -365,7 +361,7 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
     // ====== Echte sonic boom ======
     // In het spel geldt BOOM_SPEED als "geluidssnelheid" (Mach 1). Daarboven verandert de schokkegel net als
     // in het echt: halve tophoek = asin(1 / Mach). Bij Mach 1 is het een vlakke schijf, bij Mach 2 een
-    // spitse kegel van 30 graden. Bij een echte sonic boom hoor je ook een dubbele knal.
+    // spitse kegel van 30 graden. Een echte sonic boom klinkt als een dubbele knal.
     private double machOf(double speed) {
         return Math.max(1.05, Math.min(4.0, speed / BOOM_SPEED));
     }
@@ -381,13 +377,6 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
         return new Vector[]{u, v};
     }
 
-    private void showBoomTitle(Player p, double mach) {
-        p.showTitle(Title.title(Component.empty(),
-                Component.text(String.format("SONIC BOOM - Mach %.1f", mach), NamedTextColor.GOLD,
-                        TextDecoration.BOLD),
-                Title.Times.times(Duration.ZERO, Duration.ofMillis(800), Duration.ofMillis(300))));
-    }
-
     private void sonicBoom(Location loc, Vector direction, double mach, double scale, Entity... skip) {
         World w = loc.getWorld();
         Vector dir = direction.clone();
@@ -399,21 +388,22 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
         final Vector fv = b[1];
         final Location origin = loc.clone();
 
-        // Dubbele knal
-        w.playSound(loc, Sound.ENTITY_LIGHTNING_BOLT_THUNDER, 8f, 1.5f);
-        w.playSound(loc, Sound.ENTITY_GENERIC_EXPLODE, 4f, 1.3f);
+        // Dubbele knal (niet te hard)
+        w.playSound(loc, Sound.ENTITY_LIGHTNING_BOLT_THUNDER, 3f, 1.5f);
+        w.playSound(loc, Sound.ENTITY_GENERIC_EXPLODE, 1.5f, 1.3f);
         Bukkit.getScheduler().runTaskLater(this, () -> {
-            w.playSound(origin, Sound.ENTITY_LIGHTNING_BOLT_THUNDER, 8f, 1.2f);
-            w.playSound(origin, Sound.ENTITY_GENERIC_EXPLODE, 4f, 0.9f);
+            w.playSound(origin, Sound.ENTITY_LIGHTNING_BOLT_THUNDER, 3f, 1.2f);
+            w.playSound(origin, Sound.ENTITY_GENERIC_EXPLODE, 1.5f, 0.9f);
         }, 4L);
 
         // Lichtflits en kern
         w.spawnParticle(Particle.EXPLOSION_EMITTER, loc, 1);
-        w.spawnParticle(Particle.END_ROD, loc, 60, 0.6, 0.6, 0.6, 0.35);
+        w.spawnParticle(Particle.END_ROD, loc, 120, 0.8, 0.8, 0.8, 0.5);
+        w.spawnParticle(Particle.CLOUD, loc, 80, 1.0, 1.0, 1.0, 0.3);
 
         final double tanMach = Math.tan(Math.asin(1.0 / mach));
-        final double coneLength = 16 * scale;
-        final double maxRadius = 9 * scale;
+        final double coneLength = 22 * scale;
+        final double maxRadius = 8 * scale;
 
         new BukkitRunnable() {
             int i = 0;
@@ -422,33 +412,46 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
             public void run() {
                 i++;
 
-                // 1) Schokgolfschijf loodrecht op de vliegrichting, dijt uit en drijft naar achteren
-                double ringR = (1.0 + i * 1.3) * scale;
-                Location rc = origin.clone().subtract(fd.clone().multiply(i * 0.4));
-                int pts = (int) (24 + ringR * 6);
-                for (int k = 0; k < pts; k++) {
-                    double a = k * Math.PI * 2 / pts;
-                    Vector off = fu.clone().multiply(Math.cos(a) * ringR).add(fv.clone().multiply(Math.sin(a) * ringR));
-                    w.spawnParticle(Particle.CLOUD, rc.clone().add(off), 1, 0, 0, 0, 0);
+                // 1) Twee uitdijende schokgolfringen (voor- en achterschokgolf) met een heldere rand
+                for (int wave = 0; wave < 2; wave++) {
+                    int t = i - wave * 4;
+                    if (t < 1 || t > 10) continue;
+                    double ringR = (1.0 + t * 1.6) * scale;
+                    Location rc = origin.clone().subtract(fd.clone().multiply(t * 0.5 + wave * 0.8));
+                    int pts = (int) (28 + ringR * 6);
+                    for (int k = 0; k < pts; k++) {
+                        double a = k * Math.PI * 2 / pts;
+                        Vector off = fu.clone().multiply(Math.cos(a) * ringR)
+                                .add(fv.clone().multiply(Math.sin(a) * ringR));
+                        Location pt = rc.clone().add(off);
+                        w.spawnParticle(Particle.CLOUD, pt, 1, 0, 0, 0, 0);
+                        if (k % 3 == 0) w.spawnParticle(Particle.END_ROD, pt, 1, 0, 0, 0, 0);
+                    }
                 }
 
-                // 2) Machkegel (condensatiewolk): schil die in 8 ticks achter je uitgroeit
+                // 2) Machkegel (condensatiewolk): dubbele schil + heldere streep langs de as, groeit achter je uit
                 if (i <= 8) {
                     double from = (i - 1) * coneLength / 8;
                     double to = i * coneLength / 8;
-                    for (double a = from; a < to; a += 0.7) {
-                        double r = Math.min(a * tanMach, maxRadius);
-                        Location axis = origin.clone().subtract(fd.clone().multiply(a));
-                        int n = Math.max(8, (int) (r * 5));
+                    for (double d = from; d < to; d += 0.6) {
+                        double r = Math.min(d * tanMach, maxRadius);
+                        Location axis = origin.clone().subtract(fd.clone().multiply(d));
+                        w.spawnParticle(Particle.END_ROD, axis, 1, 0.1, 0.1, 0.1, 0.01);
+                        int n = Math.max(10, (int) (r * 7));
                         for (int k = 0; k < n; k++) {
                             double ang = k * Math.PI * 2 / n;
-                            Vector off = fu.clone().multiply(Math.cos(ang) * r)
-                                    .add(fv.clone().multiply(Math.sin(ang) * r));
-                            w.spawnParticle(Particle.CLOUD, axis.clone().add(off), 1, 0, 0, 0, 0);
+                            double ca = Math.cos(ang);
+                            double sa = Math.sin(ang);
+                            Vector outer = fu.clone().multiply(ca * r).add(fv.clone().multiply(sa * r));
+                            w.spawnParticle(Particle.CLOUD, axis.clone().add(outer), 1, 0, 0, 0, 0);
+                            if (k % 4 == 0) {
+                                Vector inner = fu.clone().multiply(ca * r * 0.6).add(fv.clone().multiply(sa * r * 0.6));
+                                w.spawnParticle(Particle.END_ROD, axis.clone().add(inner), 1, 0, 0, 0, 0);
+                            }
                         }
                     }
                 }
-                if (i >= 12) cancel();
+                if (i >= 16) cancel();
             }
         }.runTaskTimer(this, 0L, 1L);
 
@@ -473,10 +476,12 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
         Vector[] b = basis(d);
         Location c = at.clone().subtract(d.clone().multiply(2.5));
         World w = at.getWorld();
-        for (int k = 0; k < 20; k++) {
-            double a = k * Math.PI * 2 / 20;
-            Vector off = b[0].clone().multiply(Math.cos(a) * 1.8).add(b[1].clone().multiply(Math.sin(a) * 1.8));
-            w.spawnParticle(Particle.CLOUD, c.clone().add(off), 1, 0, 0, 0, 0);
+        for (int k = 0; k < 24; k++) {
+            double a = k * Math.PI * 2 / 24;
+            Vector off = b[0].clone().multiply(Math.cos(a) * 2.2).add(b[1].clone().multiply(Math.sin(a) * 2.2));
+            Location pt = c.clone().add(off);
+            w.spawnParticle(Particle.CLOUD, pt, 1, 0, 0, 0, 0);
+            if (k % 3 == 0) w.spawnParticle(Particle.END_ROD, pt, 1, 0, 0, 0, 0);
         }
     }
 
@@ -484,7 +489,7 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
     private void takeoffBoom(Player p) {
         final Location feet = p.getLocation();
         final World w = feet.getWorld();
-        sonicBoom(feet.clone().add(0, 0.6, 0), new Vector(0, 1, 0), 1.5, 1.2, p);
+        sonicBoom(feet.clone().add(0, 0.6, 0), new Vector(0, 1, 0), 1.5, 1.5, p);
 
         Block below = feet.clone().subtract(0, 0.5, 0).getBlock();
         final BlockData data = below.getType().isAir() ? null : below.getBlockData();
@@ -494,17 +499,17 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
             @Override
             public void run() {
                 i++;
-                double r = i * 1.4;
+                double r = i * 1.6;
                 int pts = (int) (16 + r * 8);
                 for (int k = 0; k < pts; k++) {
                     double a = k * Math.PI * 2 / pts;
                     Location pt = feet.clone().add(Math.cos(a) * r, 0.2, Math.sin(a) * r);
                     w.spawnParticle(Particle.CLOUD, pt, 1, 0, 0, 0, 0);
                     if (data != null) {
-                        w.spawnParticle(Particle.BLOCK, pt, 2, 0.2, 0.1, 0.2, 0.05, data);
+                        w.spawnParticle(Particle.BLOCK, pt, 3, 0.2, 0.15, 0.2, 0.05, data);
                     }
                 }
-                if (i >= 9) cancel();
+                if (i >= 12) cancel();
             }
         }.runTaskTimer(this, 0L, 1L);
     }
@@ -566,7 +571,8 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
             target = pl.clone().add(f.clone().multiply(HOLD_FRONT)).add(0, HOLD_HEIGHT, 0);
         }
         if (s.flying) target.add(s.vel);
-        target.setYaw(pl.getYaw());
+        // Dwars voor je liggend: je handen hangen precies naast zijn heupen
+        target.setYaw(pl.getYaw() + 90f);
         target.setPitch(0f);
 
         v.teleport(target);
@@ -620,6 +626,17 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
         sendBar(p, s);
     }
 
+    // Gooi-toets (Q) terwijl je iemand vasthoudt = ook gooien (werkt als je iets in je hand hebt)
+    @EventHandler
+    public void onDrop(PlayerDropItemEvent event) {
+        Player p = event.getPlayer();
+        State s = active.get(p.getUniqueId());
+        if (s == null || s.grab == null) return;
+        event.setCancelled(true);
+        throwVictim(p, s);
+        sendBar(p, s);
+    }
+
     // Linkermuisknop terwijl je iemand vasthoudt = gooien (ook als je de persoon zelf raakt)
     @EventHandler
     public void onDamage(EntityDamageByEntityEvent event) {
@@ -641,7 +658,7 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
         if (!v.isValid()) return;
 
         Vector dir = p.getLocation().getDirection().normalize();
-        double speed = p.isSneaking() ? HARD_THROW_SPEED : THROW_SPEED;
+        double speed = SONIC_THROW_SPEED;
         if (s.flying) speed += Math.max(0, s.vel.dot(dir));
         speed = Math.min(speed, 3.9); // hogere snelheden kan Minecraft niet versturen
 
@@ -653,16 +670,21 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
         t.thrower = p.getUniqueId();
         t.speed = speed;
         t.wasAware = g.wasAware;
+        t.lethal = isHighUp(p);
         t.last = v.getLocation();
         thrown.add(t);
 
         p.getWorld().playSound(p.getLocation(), Sound.ENTITY_PLAYER_ATTACK_STRONG, 2f, 0.7f);
-        boolean flyingFast = s.flying && s.vel.length() >= BOOM_SPEED;
-        if (speed >= THROW_BOOM_SPEED || flyingFast) {
-            double mach = machOf(speed);
-            sonicBoom(v.getLocation().add(0, 0.5, 0), dir, mach, 1.8, p, v);
-            showBoomTitle(p, mach);
-        }
+        double mach = machOf(speed);
+        sonicBoom(v.getLocation().add(0, 0.5, 0), dir, mach, 1.8, p, v);
+    }
+
+    /** Hoog = er zit geen blok binnen HIGH_THROW_HEIGHT blokken onder je. */
+    private boolean isHighUp(Player p) {
+        Location l = p.getLocation();
+        RayTraceResult r = l.getWorld().rayTraceBlocks(l, new Vector(0, -1, 0), HIGH_THROW_HEIGHT + 1,
+                FluidCollisionMode.NEVER, true);
+        return r == null;
     }
 
     private void tickThrown() {
@@ -699,12 +721,23 @@ public class SupermanPlugin extends JavaPlugin implements Listener {
     private void impact(Thrown t, Location l) {
         LivingEntity v = t.entity;
         World w = l.getWorld();
-        double dmg = Math.min(t.speed * IMPACT_DAMAGE_PER_SPEED, 40);
         Player thrower = Bukkit.getPlayer(t.thrower);
-        if (thrower != null) {
-            v.damage(dmg, thrower);
+        if (t.lethal) {
+            // Gegooid vanaf grote hoogte: altijd dodelijk, ook met de beste armor of een totem
+            if (thrower != null) {
+                v.damage(10000.0, thrower);
+            } else {
+                v.damage(10000.0);
+            }
+            if (!v.isDead()) v.setHealth(0);
+            w.spawnParticle(Particle.EXPLOSION_EMITTER, l, 2);
         } else {
-            v.damage(dmg);
+            double dmg = Math.min(t.speed * IMPACT_DAMAGE_PER_SPEED, 40);
+            if (thrower != null) {
+                v.damage(dmg, thrower);
+            } else {
+                v.damage(dmg);
+            }
         }
         w.spawnParticle(Particle.EXPLOSION, l, 1);
         w.spawnParticle(Particle.CLOUD, l, 40, 0.8, 0.3, 0.8, 0.1);
