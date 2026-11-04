@@ -1,0 +1,14 @@
+name: SupermanPlugin
+version: '1.0.0'
+main: nl.superman.SupermanPlugin
+api-version: '26.1'
+description: 'Superman-modus: vliegen, mensen en dieren oppakken en gooien, sonic booms'
+commands:
+  superman:
+    description: 'Zet de Superman-modus aan of uit'
+    usage: '/superman'
+    permission: superman.use
+permissions:
+  superman.use:
+    description: 'Mag /superman gebruiken'
+    default: op
